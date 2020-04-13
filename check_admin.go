@@ -238,10 +238,15 @@ func (i *iamCheck) isAdminPolicy(policyArn string) (bool, error) {
 		return false, err
 	}
 	for _, statement := range doc.Statement {
+		if statement.Effect == "" || statement.Action == nil || statement.Resource == nil {
+			continue
+		}
+
 		if statement.Effect != "Allow" {
 			// Denyルールの方が強いが無視
 			continue
 		}
+
 		dangerAction := false
 		if reflect.TypeOf(statement.Action).Name() == "string" {
 			if statement.Action.(string) == iamAllAction ||
