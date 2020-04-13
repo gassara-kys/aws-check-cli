@@ -29,6 +29,6 @@ build: test
 run: build
 	source env.sh && bin/$(APPNAME)
 
-.PHONY: iam-admin-check
-iam-admin-check: build
-	source env.sh && bin/$(APPNAME) iam-admin-check
+.PHONY: check-admin
+check-admin: build
+	source env.sh && bin/$(APPNAME) check-admin --admin-only
