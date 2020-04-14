@@ -147,47 +147,111 @@ func (i *iamCheck) enablePermissionBoundory(userName string) (bool, error) {
 }
 
 func (i *iamCheck) hasUserAdmin(userName string) (bool, error) {
-	result, err := i.Svc.ListAttachedUserPolicies(&iam.ListAttachedUserPoliciesInput{
-		UserName: aws.String(userName),
-	})
+	// Managed policies
+	mngPolicies, err := i.Svc.ListAttachedUserPolicies(
+		&iam.ListAttachedUserPoliciesInput{
+			UserName: aws.String(userName),
+		})
 	if err != nil {
 		return false, err
 	}
-	for _, policy := range result.AttachedPolicies {
+	// TODO Debug
+	fmt.Fprintf(i.Out, "user: %s ---------------------------------------\n managed policy: %+v\n", userName, mngPolicies.AttachedPolicies)
 
-		if isAdmin, err := i.isAdminPolicy(*policy.PolicyArn); err != nil {
+	for _, p := range mngPolicies.AttachedPolicies {
+		if i.isAdminManagedPolicy(*p.PolicyArn) {
+			return true, nil
+		}
+	}
+
+	// Inline policies
+	inlinePolicies, err := i.Svc.ListUserPolicies(
+		&iam.ListUserPoliciesInput{
+			UserName: aws.String(userName),
+		})
+	if err != nil {
+		return false, err
+	}
+	for _, pNm := range inlinePolicies.PolicyNames {
+		p, err := i.Svc.GetUserPolicy(&iam.GetUserPolicyInput{
+			UserName:   aws.String(userName),
+			PolicyName: pNm,
+		})
+		if err != nil {
 			return false, err
-		} else if isAdmin {
-			return isAdmin, nil
+		}
+		pd, err := i.convertPolicyDocument(p.PolicyDocument)
+		if err != nil {
+			return false, err
+		}
+		if i.isAdminInlinePolicy(pd) {
+			return true, nil
 		}
 	}
 	return false, nil
 }
 
 func (i *iamCheck) hasGroupAdmin(userName string) (bool, error) {
-	result, err := i.Svc.ListGroupsForUser(&iam.ListGroupsForUserInput{
-		UserName: aws.String(userName),
-	})
+	gs, err := i.Svc.ListGroupsForUser(
+		&iam.ListGroupsForUserInput{
+			UserName: aws.String(userName),
+		})
 	if err != nil {
 		return false, err
 	}
-	for _, g := range result.Groups {
-		policies, err := i.Svc.ListAttachedGroupPolicies(&iam.ListAttachedGroupPoliciesInput{
-			GroupName: aws.String(*g.GroupName),
-		})
+	for _, g := range gs.Groups {
+		// Managed Policy
+		mngPolicies, err := i.Svc.ListAttachedGroupPolicies(
+			&iam.ListAttachedGroupPoliciesInput{
+				GroupName: aws.String(*g.GroupName),
+			})
 		if err != nil {
 			return false, err
 		}
-		for _, p := range policies.AttachedPolicies {
-			if isAdmin, err := i.isAdminPolicy(*p.PolicyArn); err != nil {
-				return false, err
-			} else if isAdmin {
-				return isAdmin, nil
+		for _, p := range mngPolicies.AttachedPolicies {
+			if i.isAdminManagedPolicy(*p.PolicyArn) {
+				return true, nil
 			}
+		}
 
+		// Inline Policy
+		inlinePolicies, err := i.Svc.ListGroupPolicies(
+			&iam.ListGroupPoliciesInput{
+				GroupName: aws.String(*g.GroupName),
+			})
+		if err != nil {
+			return false, err
+		}
+		for _, pNm := range inlinePolicies.PolicyNames {
+			p, err := i.Svc.GetGroupPolicy(
+				&iam.GetGroupPolicyInput{
+					GroupName:  aws.String(*g.GroupName),
+					PolicyName: pNm,
+				})
+			if err != nil {
+				return false, err
+			}
+			pd, err := i.convertPolicyDocument(p.PolicyDocument)
+			if err != nil {
+				return false, err
+			}
+			if i.isAdminInlinePolicy(pd) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
+}
+
+type policyDocumentRaw struct {
+	Version   string
+	Statement []statementEntryRaw
+}
+
+type statementEntryRaw struct {
+	Effect   string
+	Action   interface{}
+	Resource interface{}
 }
 
 type policyDocument struct {
@@ -197,88 +261,86 @@ type policyDocument struct {
 
 type statementEntry struct {
 	Effect   string
-	Action   interface{}
-	Resource interface{}
+	Action   []string
+	Resource []string
 }
 
-// AdministartorAccessかIAMFullAccessがあればtrue、インラインポリシーで←相当のものがあってもtrueを返します
-// ※ただし、インラインポリシーは現状Denyがあっても無視します（Allowルールしか見ない）
-func (i *iamCheck) isAdminPolicy(policyArn string) (bool, error) {
-	// check admin managed policy
-	if policyArn == managedAdminArn {
-		return true, nil
-	} else if policyArn == managedIAMFullArn {
-		return true, nil
-	}
-
-	// check policyDocument
-	p, err := i.Svc.GetPolicy(&iam.GetPolicyInput{
-		PolicyArn: aws.String(policyArn),
-	})
+func (i *iamCheck) convertPolicyDocument(doc *string) (policyDocument, error) {
+	var pd policyDocument
+	decodedDoc, err := url.QueryUnescape(*doc)
 	if err != nil {
-		return false, err
+		return pd, err
 	}
-
-	pv, err := i.Svc.GetPolicyVersion(&iam.GetPolicyVersionInput{
-		PolicyArn: aws.String(policyArn),
-		VersionId: aws.String(*p.Policy.DefaultVersionId),
-	})
-	if err != nil {
-		return false, err
+	var pdRaw policyDocumentRaw
+	if err := json.Unmarshal([]byte(decodedDoc), &pdRaw); err != nil {
+		return pd, err
 	}
-	decodedDoc, err := url.QueryUnescape(aws.StringValue(pv.PolicyVersion.Document))
-	if err != nil {
-		return false, err
-	}
-	// TODO Debug
-	// fmt.Fprintf(i.Out, "doc: %s\n", decodedDoc)
-
-	var doc policyDocument
-	if err := json.Unmarshal([]byte(decodedDoc), &doc); err != nil {
-		return false, err
-	}
-	for _, statement := range doc.Statement {
-		if statement.Effect == "" || statement.Action == nil || statement.Resource == nil {
+	pd.Version = pdRaw.Version
+	for _, stmtRaw := range pdRaw.Statement {
+		if stmtRaw.Effect == "" || stmtRaw.Action == nil || stmtRaw.Resource == nil {
 			continue
 		}
+		var stmt statementEntry
+		stmt.Effect = stmtRaw.Effect
 
-		if statement.Effect != "Allow" {
+		// convert action interface{} -> []string
+		var actions []string
+		if reflect.TypeOf(stmtRaw.Action).Name() == "string" {
+			actions = append(actions, stmtRaw.Action.(string))
+		} else {
+			actions = append(actions, stmtRaw.Action.([]string)...)
+		}
+		stmt.Action = actions
+
+		// convert resource interface{} -> []string
+		var resources []string
+		if reflect.TypeOf(stmtRaw.Resource).Name() == "string" {
+			resources = append(resources, stmtRaw.Resource.(string))
+		} else {
+			resources = append(resources, stmtRaw.Resource.([]string)...)
+		}
+		stmt.Resource = resources
+		pd.Statement = append(pd.Statement, stmt)
+	}
+
+	return pd, nil
+}
+
+// Inline PolicyのAdmin判定
+// ※ただし、現状Denyがあっても無視します（Allowルールしか見ない）
+func (i *iamCheck) isAdminInlinePolicy(doc policyDocument) bool {
+	for _, stmt := range doc.Statement {
+		if stmt.Effect != "Allow" {
 			// Denyルールの方が強いが無視
 			continue
 		}
 
 		dangerAction := false
-		if reflect.TypeOf(statement.Action).Name() == "string" {
-			if statement.Action.(string) == iamAllAction ||
-				statement.Action.(string) == allAction {
+		for _, a := range stmt.Action {
+			if a == allAction || a == iamAllAction {
 				dangerAction = true
-			}
-		} else {
-			x := statement.Action.([]interface{})
-			for i := 0; i < len(x); i++ {
-				if x[i].(string) == iamAllAction ||
-					x[i].(string) == allAction {
-					dangerAction = true
-				}
+				break
 			}
 		}
-
 		dangerResource := false
-		if reflect.TypeOf(statement.Resource).Name() == "string" {
-			if statement.Resource.(string) == allResouce {
+		for _, a := range stmt.Resource {
+			if a == allResouce {
 				dangerResource = true
-			}
-		} else {
-			x := statement.Resource.([]interface{})
-			for i := 0; i < len(x); i++ {
-				if x[i].(string) == allResouce {
-					dangerResource = true
-				}
+				break
 			}
 		}
 		if dangerAction && dangerResource {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
+}
+
+// ManagedPolicyのAdmin判定
+// ※ただし、現状Denyがあっても無視します
+func (i *iamCheck) isAdminManagedPolicy(policyArn string) bool {
+	if policyArn == managedAdminArn || policyArn == managedIAMFullArn {
+		return true
+	}
+	return false
 }
