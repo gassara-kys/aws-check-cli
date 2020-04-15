@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash -eu
 
 # output sample
 # {
@@ -26,7 +26,14 @@ while read line; do
   RESULT=""
   echo "check with ${line}"
   export ASSUME_ROLE_ARN="${line}" 
-  RESULT=`${DIR_NAME}/../bin/aws-check-cli check-admin --admin-only`
+
+  set +e
+  RESULT=`${DIR_NAME}/../bin/aws-check-cli admin-check --admin-only`
+  if [ $? -gt 0 ]; then
+    continue
+  fi
+  set -e
+
   if [ -n "${RESULT}" ]; then
     if [ "${FIRST}" = "true" ]; then
       echo "{" >> ${DIR_NAME}/admin.json

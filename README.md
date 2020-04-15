@@ -9,12 +9,12 @@ $ vi env.sh
 
 ## check admin users
 ```bash
-$ make check-admin
+$ make admin-check
 ```
 
 ## check admin users to cross-account with assume-role
 ```bash
 $ export ASSUME_ROLE_ARN="arn:aws:iam::123456789012:role/YOUR_ASSUME_ROLE_HERE" 
-$ make check-admin
+$ make admin-check
 # show admin user on json format 
 ```

@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
-	"reflect"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
@@ -25,7 +23,7 @@ const (
 
 func init() {
 	cmdList = append(cmdList, cli.Command{
-		Name:  "check-admin",
+		Name:  "admin-check",
 		Usage: "check for IAM-USER that may have administrator access",
 		Flags: []cli.Flag{
 			cli.StringFlag{
@@ -40,12 +38,12 @@ func init() {
 			},
 		},
 		Action: func(c *cli.Context) error {
-			return action(c, &iamCheck{Out: os.Stdout})
+			return action(c, &adminChecker{Out: os.Stdout})
 		},
 	})
 }
 
-type iamCheck struct {
+type adminChecker struct {
 	Out  io.Writer
 	Sess *session.Session
 	Svc  *iam.IAM
@@ -58,15 +56,15 @@ type adminUser struct {
 	EnablePermissionBoundory bool   `json:"enable_permission_boundory"`
 }
 
-func (i *iamCheck) Run(c *cli.Context, region string) error {
-	return i.Main(region, c.String("assume-role-arn"), c.Bool("admin-only"))
+func (a *adminChecker) Run(c *cli.Context, region string) error {
+	return a.Main(region, c.String("assume-role-arn"), c.Bool("admin-only"))
 }
 
-func (i *iamCheck) Main(region, assumeRole string, adminOnly bool) error {
-	if err := i.newAWSSession(region, assumeRole); err != nil {
+func (a *adminChecker) Main(region, assumeRole string, adminOnly bool) error {
+	if err := a.newAWSSession(region, assumeRole); err != nil {
 		return err
 	}
-	result, err := i.Svc.ListUsers(&iam.ListUsersInput{
+	result, err := a.Svc.ListUsers(&iam.ListUsersInput{
 		MaxItems: aws.Int64(10),
 	})
 	if err != nil {
@@ -83,19 +81,19 @@ func (i *iamCheck) Main(region, assumeRole string, adminOnly bool) error {
 		}
 
 		// Permission Boundory
-		if enabled, err := i.enablePermissionBoundory(*user.UserName); err != nil {
+		if enabled, err := a.enablePermissionBoundory(*user.UserName); err != nil {
 			return err
 		} else {
 			admin.EnablePermissionBoundory = enabled
 		}
 		// User attached policy
-		if has, err := i.hasUserAdmin(*user.UserName); err != nil {
+		if has, err := a.hasUserAdmin(*user.UserName); err != nil {
 			return err
 		} else if has {
 			admin.HasUserAdmin = true
 		}
 		// Group attached policy
-		if has, err := i.hasGroupAdmin(*user.UserName); err != nil {
+		if has, err := a.hasGroupAdmin(*user.UserName); err != nil {
 			return err
 		} else if has {
 			admin.HasGroupAdmin = true
@@ -113,12 +111,12 @@ func (i *iamCheck) Main(region, assumeRole string, adminOnly bool) error {
 	if output, err := json.MarshalIndent(adminUsers, "", "  "); err != nil {
 		return err
 	} else {
-		fmt.Fprintf(i.Out, "%s", string(output))
+		fmt.Fprintf(a.Out, "%s", string(output))
 	}
 	return nil
 }
 
-func (i *iamCheck) newAWSSession(region, assumeRole string) error {
+func (a *adminChecker) newAWSSession(region, assumeRole string) error {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(region)},
 	)
@@ -131,13 +129,13 @@ func (i *iamCheck) newAWSSession(region, assumeRole string) error {
 			Credentials: stscreds.NewCredentials(sess, assumeRole),
 		})
 	}
-	i.Sess = sess
-	i.Svc = iam.New(i.Sess)
+	a.Sess = sess
+	a.Svc = iam.New(a.Sess)
 	return nil
 }
 
-func (i *iamCheck) enablePermissionBoundory(userName string) (bool, error) {
-	result, err := i.Svc.GetUser(&iam.GetUserInput{
+func (a *adminChecker) enablePermissionBoundory(userName string) (bool, error) {
+	result, err := a.Svc.GetUser(&iam.GetUserInput{
 		UserName: aws.String(userName),
 	})
 	if err != nil {
@@ -146,53 +144,44 @@ func (i *iamCheck) enablePermissionBoundory(userName string) (bool, error) {
 	return result.User.PermissionsBoundary != nil, nil
 }
 
-func (i *iamCheck) hasUserAdmin(userName string) (bool, error) {
+func (a *adminChecker) hasUserAdmin(userName string) (bool, error) {
 	// Managed policies
-	mngPolicies, err := i.Svc.ListAttachedUserPolicies(
+	mngPolicies, err := a.Svc.ListAttachedUserPolicies(
 		&iam.ListAttachedUserPoliciesInput{
 			UserName: aws.String(userName),
 		})
 	if err != nil {
 		return false, err
 	}
-	// TODO Debug
-	fmt.Fprintf(i.Out, "user: %s ---------------------------------------\n managed policy: %+v\n", userName, mngPolicies.AttachedPolicies)
-
 	for _, p := range mngPolicies.AttachedPolicies {
-		if i.isAdminManagedPolicy(*p.PolicyArn) {
+		if isAdmin, err := a.isAdminManagedPolicy(*p.PolicyArn); err != nil {
+			return false, err
+		} else if isAdmin {
 			return true, nil
 		}
 	}
 
 	// Inline policies
-	inlinePolicies, err := i.Svc.ListUserPolicies(
+	inlinePolicies, err := a.Svc.ListUserPolicies(
 		&iam.ListUserPoliciesInput{
 			UserName: aws.String(userName),
 		})
 	if err != nil {
 		return false, err
 	}
-	for _, pNm := range inlinePolicies.PolicyNames {
-		p, err := i.Svc.GetUserPolicy(&iam.GetUserPolicyInput{
-			UserName:   aws.String(userName),
-			PolicyName: pNm,
-		})
-		if err != nil {
+	for _, policyNm := range inlinePolicies.PolicyNames {
+		if isAdmin, err := a.isAdminUserInlinePolicy(&userName, policyNm); err != nil {
 			return false, err
-		}
-		pd, err := i.convertPolicyDocument(p.PolicyDocument)
-		if err != nil {
-			return false, err
-		}
-		if i.isAdminInlinePolicy(pd) {
+
+		} else if isAdmin {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (i *iamCheck) hasGroupAdmin(userName string) (bool, error) {
-	gs, err := i.Svc.ListGroupsForUser(
+func (a *adminChecker) hasGroupAdmin(userName string) (bool, error) {
+	gs, err := a.Svc.ListGroupsForUser(
 		&iam.ListGroupsForUserInput{
 			UserName: aws.String(userName),
 		})
@@ -201,7 +190,7 @@ func (i *iamCheck) hasGroupAdmin(userName string) (bool, error) {
 	}
 	for _, g := range gs.Groups {
 		// Managed Policy
-		mngPolicies, err := i.Svc.ListAttachedGroupPolicies(
+		mngPolicies, err := a.Svc.ListAttachedGroupPolicies(
 			&iam.ListAttachedGroupPoliciesInput{
 				GroupName: aws.String(*g.GroupName),
 			})
@@ -209,33 +198,26 @@ func (i *iamCheck) hasGroupAdmin(userName string) (bool, error) {
 			return false, err
 		}
 		for _, p := range mngPolicies.AttachedPolicies {
-			if i.isAdminManagedPolicy(*p.PolicyArn) {
+			if isAdmin, err := a.isAdminManagedPolicy(*p.PolicyArn); err != nil {
+				return false, err
+			} else if isAdmin {
 				return true, nil
 			}
 		}
 
 		// Inline Policy
-		inlinePolicies, err := i.Svc.ListGroupPolicies(
+		inlinePolicies, err := a.Svc.ListGroupPolicies(
 			&iam.ListGroupPoliciesInput{
 				GroupName: aws.String(*g.GroupName),
 			})
 		if err != nil {
 			return false, err
 		}
-		for _, pNm := range inlinePolicies.PolicyNames {
-			p, err := i.Svc.GetGroupPolicy(
-				&iam.GetGroupPolicyInput{
-					GroupName:  aws.String(*g.GroupName),
-					PolicyName: pNm,
-				})
-			if err != nil {
+		for _, policyNm := range inlinePolicies.PolicyNames {
+			if isAdmin, err := a.isAdminGroupInlinePolicy(g.GroupName, policyNm); err != nil {
 				return false, err
-			}
-			pd, err := i.convertPolicyDocument(p.PolicyDocument)
-			if err != nil {
-				return false, err
-			}
-			if i.isAdminInlinePolicy(pd) {
+
+			} else if isAdmin {
 				return true, nil
 			}
 		}
@@ -243,72 +225,9 @@ func (i *iamCheck) hasGroupAdmin(userName string) (bool, error) {
 	return false, nil
 }
 
-type policyDocumentRaw struct {
-	Version   string
-	Statement []statementEntryRaw
-}
-
-type statementEntryRaw struct {
-	Effect   string
-	Action   interface{}
-	Resource interface{}
-}
-
-type policyDocument struct {
-	Version   string
-	Statement []statementEntry
-}
-
-type statementEntry struct {
-	Effect   string
-	Action   []string
-	Resource []string
-}
-
-func (i *iamCheck) convertPolicyDocument(doc *string) (policyDocument, error) {
-	var pd policyDocument
-	decodedDoc, err := url.QueryUnescape(*doc)
-	if err != nil {
-		return pd, err
-	}
-	var pdRaw policyDocumentRaw
-	if err := json.Unmarshal([]byte(decodedDoc), &pdRaw); err != nil {
-		return pd, err
-	}
-	pd.Version = pdRaw.Version
-	for _, stmtRaw := range pdRaw.Statement {
-		if stmtRaw.Effect == "" || stmtRaw.Action == nil || stmtRaw.Resource == nil {
-			continue
-		}
-		var stmt statementEntry
-		stmt.Effect = stmtRaw.Effect
-
-		// convert action interface{} -> []string
-		var actions []string
-		if reflect.TypeOf(stmtRaw.Action).Name() == "string" {
-			actions = append(actions, stmtRaw.Action.(string))
-		} else {
-			actions = append(actions, stmtRaw.Action.([]string)...)
-		}
-		stmt.Action = actions
-
-		// convert resource interface{} -> []string
-		var resources []string
-		if reflect.TypeOf(stmtRaw.Resource).Name() == "string" {
-			resources = append(resources, stmtRaw.Resource.(string))
-		} else {
-			resources = append(resources, stmtRaw.Resource.([]string)...)
-		}
-		stmt.Resource = resources
-		pd.Statement = append(pd.Statement, stmt)
-	}
-
-	return pd, nil
-}
-
-// Inline PolicyのAdmin判定
+// Policy Documentの内容がAdministrator or IAMFullAccess相当かチェックします
 // ※ただし、現状Denyがあっても無視します（Allowルールしか見ない）
-func (i *iamCheck) isAdminInlinePolicy(doc policyDocument) bool {
+func (a *adminChecker) isAdminPolicyDoc(doc policyDocument) bool {
 	for _, stmt := range doc.Statement {
 		if stmt.Effect != "Allow" {
 			// Denyルールの方が強いが無視
@@ -336,11 +255,62 @@ func (i *iamCheck) isAdminInlinePolicy(doc policyDocument) bool {
 	return false
 }
 
-// ManagedPolicyのAdmin判定
-// ※ただし、現状Denyがあっても無視します
-func (i *iamCheck) isAdminManagedPolicy(policyArn string) bool {
+// isAdminManagedPolicy AWS Managed Policy / Customer Managed PolicyのAdmin判定
+func (a *adminChecker) isAdminManagedPolicy(policyArn string) (bool, error) {
+	// Check for AWS Managed policy
 	if policyArn == managedAdminArn || policyArn == managedIAMFullArn {
-		return true
+		return true, nil
 	}
-	return false
+
+	// Check for Customer Managed policy
+	p, err := a.Svc.GetPolicy(&iam.GetPolicyInput{
+		PolicyArn: aws.String(policyArn),
+	})
+	if err != nil {
+		return false, err
+	}
+	pv, err := a.Svc.GetPolicyVersion(&iam.GetPolicyVersionInput{
+		PolicyArn: aws.String(policyArn),
+		VersionId: p.Policy.DefaultVersionId,
+	})
+	if err != nil {
+		return false, err
+	}
+	doc, err := convertPolicyDocument(pv.PolicyVersion.Document)
+	if err != nil {
+		return false, err
+	}
+	return a.isAdminPolicyDoc(doc), nil
+}
+
+// isAdminUserInlinePolicy Inline PolicyのAdmin判定
+func (a *adminChecker) isAdminUserInlinePolicy(userNm, policyNm *string) (bool, error) {
+	p, err := a.Svc.GetUserPolicy(&iam.GetUserPolicyInput{
+		UserName:   userNm,
+		PolicyName: policyNm,
+	})
+	if err != nil {
+		return false, err
+	}
+	doc, err := convertPolicyDocument(p.PolicyDocument)
+	if err != nil {
+		return false, err
+	}
+	return a.isAdminPolicyDoc(doc), nil
+}
+
+// isAdminGroupInlinePolicy Inline PolicyのAdmin判定
+func (a *adminChecker) isAdminGroupInlinePolicy(group, policy *string) (bool, error) {
+	p, err := a.Svc.GetGroupPolicy(&iam.GetGroupPolicyInput{
+		GroupName:  group,
+		PolicyName: policy,
+	})
+	if err != nil {
+		return false, err
+	}
+	doc, err := convertPolicyDocument(p.PolicyDocument)
+	if err != nil {
+		return false, err
+	}
+	return a.isAdminPolicyDoc(doc), nil
 }
