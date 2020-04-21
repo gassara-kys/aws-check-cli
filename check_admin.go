@@ -17,7 +17,8 @@ const (
 	managedAdminArn   = "arn:aws:iam::aws:policy/AdministratorAccess"
 	managedIAMFullArn = "arn:aws:iam::aws:policy/IAMFullAccess"
 	iamAllAction      = "iam:*"
-	allAction         = "*"
+	allAction1        = "*:*"
+	allAction2        = "*"
 	allResouce        = "*"
 )
 
@@ -50,10 +51,12 @@ type adminChecker struct {
 }
 
 type adminUser struct {
-	UserArn                  string `json:"user_arn"`
-	HasUserAdmin             bool   `json:"has_user_admin"`
-	HasGroupAdmin            bool   `json:"has_grorup_admin"`
-	EnablePermissionBoundory bool   `json:"enable_permission_boundory"`
+	UserArn                  string   `json:"user_arn"`
+	UserName                 string   `json:"user_name"`
+	AccessKeyID              []string `json:"access_key_id"`
+	HasUserAdmin             bool     `json:"has_user_admin"`
+	HasGroupAdmin            bool     `json:"has_grorup_admin"`
+	EnablePermissionBoundory bool     `json:"enable_permission_boundory"`
 }
 
 func (a *adminChecker) Run(c *cli.Context, region string) error {
@@ -77,7 +80,11 @@ func (a *adminChecker) Main(region, assumeRole string, adminOnly bool) error {
 			continue
 		}
 		admin := adminUser{
-			UserArn: *user.Arn,
+			UserArn:  *user.Arn,
+			UserName: *user.UserName,
+		}
+		if err := a.setAccessKeyIDs(&admin); err != nil {
+			return err
 		}
 
 		// Permission Boundory
@@ -87,13 +94,13 @@ func (a *adminChecker) Main(region, assumeRole string, adminOnly bool) error {
 			admin.EnablePermissionBoundory = enabled
 		}
 		// User attached policy
-		if has, err := a.hasUserAdmin(*user.UserName); err != nil {
+		if has, err := a.hasUserAdmin(admin.UserName); err != nil {
 			return err
 		} else if has {
 			admin.HasUserAdmin = true
 		}
 		// Group attached policy
-		if has, err := a.hasGroupAdmin(*user.UserName); err != nil {
+		if has, err := a.hasGroupAdmin(admin.UserName); err != nil {
 			return err
 		} else if has {
 			admin.HasGroupAdmin = true
@@ -131,6 +138,21 @@ func (a *adminChecker) newAWSSession(region, assumeRole string) error {
 	}
 	a.Sess = sess
 	a.Svc = iam.New(a.Sess)
+	return nil
+}
+
+func (a *adminChecker) setAccessKeyIDs(user *adminUser) error {
+	result, err := a.Svc.ListAccessKeys(&iam.ListAccessKeysInput{
+		UserName: &user.UserName,
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range result.AccessKeyMetadata {
+		if *key.Status == "Active" {
+			user.AccessKeyID = append(user.AccessKeyID, *key.AccessKeyId)
+		}
+	}
 	return nil
 }
 
@@ -236,7 +258,7 @@ func (a *adminChecker) isAdminPolicyDoc(doc policyDocument) bool {
 
 		dangerAction := false
 		for _, a := range stmt.Action {
-			if a == allAction || a == iamAllAction {
+			if a == allAction1 || a == allAction2 || a == iamAllAction {
 				dangerAction = true
 				break
 			}
