@@ -67,9 +67,7 @@ func (a *adminChecker) Main(region, assumeRole string, adminOnly bool) error {
 	if err := a.newAWSSession(region, assumeRole); err != nil {
 		return err
 	}
-	result, err := a.Svc.ListUsers(&iam.ListUsersInput{
-		MaxItems: aws.Int64(10),
-	})
+	result, err := a.Svc.ListUsers(&iam.ListUsersInput{})
 	if err != nil {
 		return err
 	}
@@ -85,6 +83,9 @@ func (a *adminChecker) Main(region, assumeRole string, adminOnly bool) error {
 		}
 		if err := a.setAccessKeyIDs(&admin); err != nil {
 			return err
+		}
+		if admin.AccessKeyID == nil {
+			continue // there are no active access keys.
 		}
 
 		// Permission Boundory
